@@ -158,33 +158,153 @@ app.post('/something', async (c) => {
 
 ## 4. 手動 Span パターン (ルートハンドラー)
 
+### 推奨: `startActiveSpan`
+
+`startActiveSpan` を使うこと。自動で現在の active context を親にし、コールバック内でスパンがアクティブになる。
+
 ```typescript
 import { SpanKind, SpanStatusCode, trace } from '@opentelemetry/api';
 
 const tracer = trace.getTracer('my-route', '1.0.0');
 
-// 推奨: startActiveSpan — 自動で親子関係が繋がり、コールバック内でアクティブになる
-await tracer.startActiveSpan(
-  'my-operation',
-  { kind: SpanKind.CLIENT, attributes: { 'db.system': 'bigquery' } },
-  async (span) => {
-    try {
-      const result = await externalCall();
-      span.setAttribute('result.count', result.length);
-      span.setStatus({ code: SpanStatusCode.OK });
-      return result;
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      span.recordException(err instanceof Error ? err : new Error(message));
-      span.setStatus({ code: SpanStatusCode.ERROR, message });
-      throw err;
-    } finally {
-      span.end();  // finally で必ず end する
-    }
-  },
-);
+// ルートハンドラー内での基本パターン
+app.post('/something', async (c) => {
+  let result;
+  try {
+    result = await tracer.startActiveSpan(
+      'my-operation',
+      { kind: SpanKind.CLIENT, attributes: { 'db.system': 'bigquery' } },
+      async (span) => {
+        try {
+          const r = await externalCall();
+          span.setAttribute('result.count', r.length);
+          span.setStatus({ code: SpanStatusCode.OK });
+          return r;
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          span.recordException(err instanceof Error ? err : new Error(message));
+          span.setStatus({ code: SpanStatusCode.ERROR, message });
+          throw err;  // re-throw して外側の catch でレスポンス返却
+        } finally {
+          span.end();  // finally で必ず 1 回だけ end する
+        }
+      },
+    );
+  } catch (err) {
+    return c.json({ error: '...' }, 500);
+  }
+  return c.json({ result });
+});
+```
 
-// withSpan ヘルパー (LoggingService) — エラー処理を自動化したい場合
+### ネスト構造 (親子 span) — Cloud Trace ウォーターフォール表示
+
+`startActiveSpan` はコールバック内でそのスパンをアクティブにするため、**コールバック内でさらに `startActiveSpan` を呼ぶだけで子スパンになる**。`context.with` による手動伝播は不要。
+
+```typescript
+// Cloud Trace に表示される構造:
+// HTTP span (POST /tools/qa/summary)
+//   └── qa.summary (parent, INTERNAL)
+//        ├── qa.generateQuery (child, INTERNAL)
+//        └── qa.search       (child, CLIENT)
+
+app.post('/summary', async (c) => {
+  try {
+    const response = await tracer.startActiveSpan(
+      'qa.summary',
+      { kind: SpanKind.INTERNAL, attributes: { 'llm.question': question } },
+      async (parentSpan) => {
+        try {
+          // 子スパン 1 — parentSpan がアクティブなので自動的に子になる
+          const query = await tracer.startActiveSpan(
+            'qa.generateQuery',
+            { kind: SpanKind.INTERNAL },
+            async (span) => {
+              try {
+                const q = await generateSearchQuery(question);
+                span.setAttribute('llm.generated_query', q);
+                span.setStatus({ code: SpanStatusCode.OK });
+                return q;
+              } catch (err) {
+                const message = err instanceof Error ? err.message : String(err);
+                span.recordException(err instanceof Error ? err : new Error(message));
+                span.setStatus({ code: SpanStatusCode.ERROR, message });
+                throw err;
+              } finally {
+                span.end();
+              }
+            },
+          );
+
+          // 子スパン 2 — parentSpan がアクティブなので自動的に子になる
+          const result = await tracer.startActiveSpan(
+            'qa.search',
+            { kind: SpanKind.CLIENT, attributes: { 'search.query': query } },
+            async (span) => {
+              try {
+                const r = await search(query);
+                span.setAttribute('search.result_count', r.length);
+                span.setStatus({ code: SpanStatusCode.OK });
+                return r;
+              } catch (err) {
+                const message = err instanceof Error ? err.message : String(err);
+                span.recordException(err instanceof Error ? err : new Error(message));
+                span.setStatus({ code: SpanStatusCode.ERROR, message });
+                throw err;
+              } finally {
+                span.end();
+              }
+            },
+          );
+
+          parentSpan.setAttribute('result.count', result.length);
+          parentSpan.setStatus({ code: SpanStatusCode.OK });
+          return c.json({ query, result });
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          parentSpan.recordException(err instanceof Error ? err : new Error(message));
+          parentSpan.setStatus({ code: SpanStatusCode.ERROR, message });
+          throw err;
+        } finally {
+          parentSpan.end();
+        }
+      },
+    );
+    return response;
+  } catch (err) {
+    return c.json({ error: String(err) }, 500);
+  }
+});
+```
+
+**ポイント:**
+- `startActiveSpan` のコールバック内では、そのスパンが自動的に active context になる
+- 入れ子で `startActiveSpan` を呼ぶだけで自動的に親子関係が形成される
+- `context.with(trace.setSpan(...))` による手動伝播は不要
+
+### アンチパターン: `span.end()` の二重呼び出し（バグ）
+
+`catch` と `finally` の両方で `span.end()` を呼ぶと、エラー発生時に必ず二重実行される。`startSpan` + `context.with` パターンで陥りやすい。
+
+```typescript
+// NG: catch と finally の両方で end している
+const span = tracer.startSpan('op');
+try {
+  await doWork();
+} catch (err) {
+  span.recordException(err);
+  span.end();   // 1回目
+  return c.json({ error: '...' }, 500);
+} finally {
+  span.end();   // 2回目（バグ）— catch で return しても finally は実行される
+}
+```
+
+`startActiveSpan` + `throw err` パターンに統一することでこのバグを根本的に防げる。
+
+### withSpan ヘルパー (LoggingService) — エラー処理を自動化したい場合
+
+```typescript
 await logger.withSpan('my-operation', async (span) => {
   span.setAttribute('key', 'value');
   return await doSomething();
@@ -209,3 +329,4 @@ await logger.withSpan('my-operation', async (span) => {
 | ログに trace 情報が付かない | `LoggingService` を使わず `console.log` を直接使用 | `logInfoWithContext` などを使う |
 | Cloud Trace にトレースが表示されない | `GOOGLE_CLOUD_PROJECT` 未設定 / IAM 権限不足 | `roles/cloudtrace.agent` を付与 |
 | tsx dev でエラー `Cannot find module 'watch'` | `--import` を `watch` サブコマンドより前に置いた | `tsx watch --import ./preload.ts src/index.ts` の順にする |
+| span データが壊れている / Cloud Trace で span の時刻が異常 | `catch` と `finally` の両方で `span.end()` を呼んでいる（二重呼び出し） | `startActiveSpan` + `throw err` パターンに統一し、`finally` のみで `span.end()` を呼ぶ |

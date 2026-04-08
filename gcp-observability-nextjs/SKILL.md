@@ -79,6 +79,8 @@ OTEL_RESOURCE_ATTRIBUTES="gcp.project_id=xxx,service.name=my-service,service.ver
 
 ## 2. Route Handler での span パターン
 
+### 基本パターン (単一 span)
+
 ```typescript
 // app/api/something/route.ts
 import { trace, SpanStatusCode, SpanKind } from '@opentelemetry/api';
@@ -86,26 +88,139 @@ import { trace, SpanStatusCode, SpanKind } from '@opentelemetry/api';
 const tracer = trace.getTracer('something-api', '1.0.0');
 
 export async function POST(request: Request) {
-  return await tracer.startActiveSpan('something.process', async (span) => {
-    try {
-      const body = await request.json();
-      span.setAttribute('request.size', JSON.stringify(body).length);
+  try {
+    return await tracer.startActiveSpan(
+      'something.process',
+      { kind: SpanKind.INTERNAL },
+      async (span) => {
+        try {
+          const body = await request.json();
+          span.setAttribute('request.size', JSON.stringify(body).length);
 
-      const result = await doWork(body);
-      span.setAttribute('result.count', result.length);
-      span.setStatus({ code: SpanStatusCode.OK });
+          const result = await doWork(body);
+          span.setAttribute('result.count', result.length);
+          span.setStatus({ code: SpanStatusCode.OK });
 
-      return Response.json(result);
-    } catch (err) {
-      span.recordException(err as Error);
-      span.setStatus({ code: SpanStatusCode.ERROR, message: (err as Error).message });
-      return Response.json({ error: 'Internal Server Error' }, { status: 500 });
-    } finally {
-      span.end();  // finally で必ず end する
-    }
-  });
+          return Response.json(result);
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          span.recordException(err instanceof Error ? err : new Error(message));
+          span.setStatus({ code: SpanStatusCode.ERROR, message });
+          throw err;  // re-throw して外側の catch でレスポンス返却
+        } finally {
+          span.end();  // finally で必ず 1 回だけ end する
+        }
+      },
+    );
+  } catch (err) {
+    return Response.json({ error: 'Internal Server Error' }, { status: 500 });
+  }
 }
 ```
+
+### ネスト構造 (親子 span) — Cloud Trace ウォーターフォール表示
+
+`startActiveSpan` はコールバック内でそのスパンをアクティブにするため、**コールバック内でさらに `startActiveSpan` を呼ぶだけで子スパンになる**。
+
+```typescript
+// Cloud Trace に表示される構造:
+// HTTP span (POST /api/something)
+//   └── something.process (parent, INTERNAL)
+//        ├── something.fetchData (child, CLIENT)
+//        └── something.transform (child, INTERNAL)
+
+export async function POST(request: Request) {
+  try {
+    return await tracer.startActiveSpan(
+      'something.process',
+      { kind: SpanKind.INTERNAL },
+      async (parentSpan) => {
+        try {
+          // 子スパン 1 — parentSpan がアクティブなので自動的に子になる
+          const data = await tracer.startActiveSpan(
+            'something.fetchData',
+            { kind: SpanKind.CLIENT, attributes: { 'db.system': 'bigquery' } },
+            async (span) => {
+              try {
+                const result = await fetchFromDB();
+                span.setAttribute('db.rows_returned', result.length);
+                span.setStatus({ code: SpanStatusCode.OK });
+                return result;
+              } catch (err) {
+                const message = err instanceof Error ? err.message : String(err);
+                span.recordException(err instanceof Error ? err : new Error(message));
+                span.setStatus({ code: SpanStatusCode.ERROR, message });
+                throw err;
+              } finally {
+                span.end();
+              }
+            },
+          );
+
+          // 子スパン 2 — parentSpan がアクティブなので自動的に子になる
+          const transformed = await tracer.startActiveSpan(
+            'something.transform',
+            { kind: SpanKind.INTERNAL },
+            async (span) => {
+              try {
+                const result = transform(data);
+                span.setAttribute('transform.output_count', result.length);
+                span.setStatus({ code: SpanStatusCode.OK });
+                return result;
+              } catch (err) {
+                const message = err instanceof Error ? err.message : String(err);
+                span.recordException(err instanceof Error ? err : new Error(message));
+                span.setStatus({ code: SpanStatusCode.ERROR, message });
+                throw err;
+              } finally {
+                span.end();
+              }
+            },
+          );
+
+          parentSpan.setAttribute('result.count', transformed.length);
+          parentSpan.setStatus({ code: SpanStatusCode.OK });
+          return Response.json(transformed);
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          parentSpan.recordException(err instanceof Error ? err : new Error(message));
+          parentSpan.setStatus({ code: SpanStatusCode.ERROR, message });
+          throw err;
+        } finally {
+          parentSpan.end();
+        }
+      },
+    );
+  } catch (err) {
+    return Response.json({ error: 'Internal Server Error' }, { status: 500 });
+  }
+}
+```
+
+**ポイント:**
+- `startActiveSpan` のコールバック内では、そのスパンが自動的に active context になる
+- 入れ子で `startActiveSpan` を呼ぶだけで自動的に親子関係が形成される
+- `context.with(trace.setSpan(...))` による手動伝播は不要
+
+### アンチパターン: `span.end()` の二重呼び出し（バグ）
+
+`catch` と `finally` の両方で `span.end()` を呼ぶと、エラー発生時に必ず二重実行される。
+
+```typescript
+// NG: catch と finally の両方で end している
+const span = tracer.startSpan('op');
+try {
+  await doWork();
+} catch (err) {
+  span.recordException(err as Error);
+  span.end();   // 1回目
+  return Response.json({ error: '...' }, { status: 500 });
+} finally {
+  span.end();   // 2回目（バグ）— catch で return しても finally は実行される
+}
+```
+
+`startActiveSpan` + `throw err` パターンに統一することでこのバグを根本的に防げる。
 
 ## 3. 構造化ロギング (LoggingService)
 
@@ -189,3 +304,4 @@ export async function POST(request: Request) {
 | Cloud Trace にトレースが表示されない | `GOOGLE_CLOUD_PROJECT` 未設定 / IAM 権限不足 | `roles/cloudtrace.agent` を付与 |
 | Edge Runtime でクラッシュ | `instrumentation-node.ts` を Edge でも import している | `NEXT_RUNTIME === 'nodejs'` で条件分岐 |
 | `register()` が呼ばれない | Next.js 14以前で設定漏れ | `next.config.ts` に `instrumentationHook: true` を追加 |
+| span データが壊れている / Cloud Trace で span の時刻が異常 | `catch` と `finally` の両方で `span.end()` を呼んでいる（二重呼び出し） | `startActiveSpan` + `throw err` パターンに統一し、`finally` のみで `span.end()` を呼ぶ |
