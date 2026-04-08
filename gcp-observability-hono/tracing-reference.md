@@ -93,7 +93,7 @@ export async function startTracing(): Promise<void> {
       traceExporter: new GoogleAuthOTLPExporter(authClient),
       instrumentations: [
         new HttpInstrumentation({
-          ignoreIncomingRequestHook: (req) => req.url === '/' || req.url === '/openapi.json',
+          ignoreIncomingRequestHook: (req) => req.url === '/health',
         }),
       ],
       textMapPropagator: new CompositePropagator({
@@ -138,12 +138,13 @@ const app = new Hono();
 
 const otelMiddleware = httpInstrumentationMiddleware();
 app.use('*', (c, next) => {
-  if (c.req.path === '/' || c.req.path === '/openapi.json') return next();
+  if (c.req.path === '/health') return next();
   return otelMiddleware(c, next);
 });
 
 app.route('/tools/something', myRoute);
 app.get('/', (c) => c.json({ status: 'ok' }));
+app.get('/health', (c) => c.json({ status: 'ok' }));
 
 serve({ fetch: app.fetch, port: Number(process.env.PORT) || 3000 }, (info) => {
   console.log(`Server is running on http://localhost:${info.port}`);
@@ -155,6 +156,7 @@ serve({ fetch: app.fetch, port: Number(process.env.PORT) || 3000 }, (info) => {
 | ロール | 用途 |
 |--------|------|
 | `roles/cloudtrace.agent` | Cloud Trace へのトレース書き込み |
+| `roles/telemetry.tracesWriter` | Telemetry API (OTLP) へのトレース書き込み |
 | `roles/logging.logWriter` | Cloud Logging への書き込み（Cloud Run は自動付与） |
 
 ## OTEL_RESOURCE_ATTRIBUTES の推奨設定

@@ -119,6 +119,7 @@ process.on('SIGTERM', async () => {
 | ロール | 用途 |
 |--------|------|
 | `roles/cloudtrace.agent` | Cloud Trace へのトレース書き込み |
+| `roles/telemetry.tracesWriter` | Telemetry API (OTLP) へのトレース書き込み |
 | `roles/logging.logWriter` | Cloud Logging への書き込み（Cloud Run は自動付与） |
 
 ## OTEL_RESOURCE_ATTRIBUTES の推奨設定
@@ -134,14 +135,15 @@ import { context, SpanKind, SpanStatusCode, trace } from '@opentelemetry/api';
 
 const tracer = trace.getTracer('my-api', '1.0.0');
 
-// startActiveSpan（コンテキストが自動伝播）
-await tracer.startActiveSpan('bigquery.query', { kind: SpanKind.CLIENT }, async (span) => {
+// startSpan + context.with（明示的なコンテキスト伝播）
+const span = tracer.startSpan('bigquery.query', { kind: SpanKind.CLIENT });
+const result = await context.with(trace.setSpan(context.active(), span), async () => {
   span.setAttribute('db.system', 'bigquery');
   try {
-    const result = await runQuery(sql);
-    span.setAttribute('db.rows_returned', result.length);
+    const r = await runQuery(sql);
+    span.setAttribute('db.rows_returned', r.length);
     span.setStatus({ code: SpanStatusCode.OK });
-    return result;
+    return r;
   } catch (err) {
     span.recordException(err as Error);
     span.setStatus({ code: SpanStatusCode.ERROR, message: (err as Error).message });

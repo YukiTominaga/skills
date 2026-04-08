@@ -5,7 +5,7 @@ Hono 版との違い: Hono の `Context` の代わりに `traceparent` と `xClo
 ## src/lib/logging.ts（または lib/logging.service.ts）
 
 ```typescript
-import { type Span, SpanStatusCode, trace } from '@opentelemetry/api';
+import { context, type Span, SpanStatusCode, trace } from '@opentelemetry/api';
 import { randomUUID } from 'crypto';
 
 const PROJECT_ID = process.env.GOOGLE_CLOUD_PROJECT ?? '';
@@ -119,7 +119,8 @@ export class LoggingService {
 
   /** カスタム span でラップ。エラー時に自動で recordException + setStatus(ERROR) */
   async withSpan<T>(spanName: string, fn: (span: Span) => Promise<T>): Promise<T> {
-    return await this.tracer.startActiveSpan(spanName, async (span) => {
+    const span = this.tracer.startSpan(spanName);
+    return await context.with(trace.setSpan(context.active(), span), async () => {
       try {
         const result = await fn(span);
         span.setStatus({ code: SpanStatusCode.OK });
@@ -144,36 +145,40 @@ export class LoggingService {
 
 ```typescript
 // app/api/something/route.ts
-import { trace, SpanStatusCode } from '@opentelemetry/api';
+import { context, trace, SpanKind, SpanStatusCode } from '@opentelemetry/api';
 import { LoggingService } from '@/lib/logging';
 
 const tracer = trace.getTracer('something-api', '1.0.0');
 const logger = new LoggingService();
 
 export async function POST(request: Request) {
-  // リクエストヘッダーから trace コンテキストを取得
   const traceparent = request.headers.get('traceparent') ?? undefined;
   const xCloudTraceContext = request.headers.get('x-cloud-trace-context') ?? undefined;
 
-  return await tracer.startActiveSpan('something.process', async (span) => {
-    try {
-      const body = await request.json();
-      logger.logInfo('processing started', { bodySize: JSON.stringify(body).length }, traceparent, xCloudTraceContext);
+  const span = tracer.startSpan('something.process', { kind: SpanKind.INTERNAL });
+  try {
+    return await context.with(trace.setSpan(context.active(), span), async () => {
+      try {
+        const body = await request.json();
+        logger.logInfo('processing started', { bodySize: JSON.stringify(body).length }, traceparent, xCloudTraceContext);
 
-      const result = await doWork(body);
+        const result = await doWork(body);
 
-      logger.logInfo('processing completed', { resultCount: result.length }, traceparent, xCloudTraceContext);
-      span.setStatus({ code: SpanStatusCode.OK });
-      return Response.json(result);
-    } catch (err) {
-      logger.logError('processing failed', err, traceparent, xCloudTraceContext);
-      span.recordException(err as Error);
-      span.setStatus({ code: SpanStatusCode.ERROR, message: (err as Error).message });
-      return Response.json({ error: 'Internal Server Error' }, { status: 500 });
-    } finally {
-      span.end();
-    }
-  });
+        logger.logInfo('processing completed', { resultCount: result.length }, traceparent, xCloudTraceContext);
+        span.setStatus({ code: SpanStatusCode.OK });
+        return Response.json(result);
+      } catch (err) {
+        logger.logError('processing failed', err, traceparent, xCloudTraceContext);
+        span.recordException(err as Error);
+        span.setStatus({ code: SpanStatusCode.ERROR, message: (err as Error).message });
+        throw err;
+      } finally {
+        span.end();
+      }
+    });
+  } catch (err) {
+    return Response.json({ error: 'Internal Server Error' }, { status: 500 });
+  }
 }
 ```
 
@@ -181,7 +186,7 @@ export async function POST(request: Request) {
 
 ```typescript
 // app/dashboard/page.tsx
-import { trace, SpanStatusCode } from '@opentelemetry/api';
+import { context, trace, SpanKind, SpanStatusCode } from '@opentelemetry/api';
 import { LoggingService } from '@/lib/logging';
 import { headers } from 'next/headers';
 
@@ -194,7 +199,8 @@ async function getDashboardData() {
   const traceparent = headersList.get('traceparent') ?? undefined;
   const xCloudTraceContext = headersList.get('x-cloud-trace-context') ?? undefined;
 
-  return await tracer.startActiveSpan('dashboard.getData', async (span) => {
+  const span = tracer.startSpan('dashboard.getData', { kind: SpanKind.INTERNAL });
+  return await context.with(trace.setSpan(context.active(), span), async () => {
     try {
       const data = await fetchData();
       logger.logInfo('dashboard data fetched', { count: data.length }, traceparent, xCloudTraceContext);

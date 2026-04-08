@@ -1,6 +1,6 @@
 ---
 name: gcp-observability-hono
-description: Hono + Node.js アプリケーションに Google Cloud Trace (Telemetry API 直接送信 OTLP) と Cloud Logging 構造化ロギングを実装するスキル。OpenTelemetry SDK の初期化、ADC を使ったトークン自動更新エクスポーター、traceparent 伝播、LoggingService パターンを扱う。GCP 可観測性、Cloud Trace、Cloud Logging、traceparent、opentelemetry、hono に関する実装を行うときに使用する。
+description: Hono + Node.js アプリケーションに Google Cloud Trace (Telemetry API 直接送信 OTLP) と Cloud Logging 構造化ロギングを実装するスキル。OpenTelemetry SDK の初期化、ADC を使ったトークン自動更新エクスポーター、startSpan + context.with() による手動 span パターン、httpInstrumentationMiddleware との組み合わせ、LoggingService パターンを扱う。GCP 可観測性、Cloud Trace、Cloud Logging、traceparent、opentelemetry、hono に関する実装を行うときに使用する。
 ---
 
 # GCP Observability for Hono
@@ -20,10 +20,11 @@ npm install @opentelemetry/api @opentelemetry/core @opentelemetry/sdk-node \
 
 ```
 リクエスト
-  → Hono (@hono/otel middleware)  ← traceparent/x-cloud-trace-context を抽出
-  → Route Handler
-      → tracer.startActiveSpan()   ← 手動 span
-      → LoggingService             ← 構造化ログ (trace 情報付き)
+  → HttpInstrumentation (NodeSDK, http モジュールレベル)  ← 自動でHTTPスパン作成
+  → httpInstrumentationMiddleware (@hono/otel)            ← Hono ルート名を span に反映
+  → Hono Route Handler
+      → tracer.startSpan() + context.with()   ← 手動 span（httpInstrumentationMiddleware スパンの子になる）
+      → LoggingService                         ← 構造化ログ (trace 情報付き)
   → Cloud Trace (Telemetry API OTLP)
   → Cloud Logging (stdout JSON)
 ```
@@ -34,43 +35,35 @@ npm install @opentelemetry/api @opentelemetry/core @opentelemetry/sdk-node \
 
 ### 重要な設計ポイント
 
-**ESM インポート順序問題 → `--import` プリロードで解決**
-
-`import` はホイストされるため、`index.ts` 内でいかなる順序で書いても、`@hono/node-server` は `startTracing()` より前にロードされる。
-`--import` フラグで `index.ts` より先にプリロードファイルを完全実行することで `HttpInstrumentation` が確実に `http` にパッチを当てる。
+**`index.ts` の先頭で `await startTracing()` を明示的に呼ぶ**
 
 ```typescript
-// src/config/tracing-preload.ts
-import { startTracing } from './tracing.js';
-
+// src/index.ts
+// OpenTelemetryの初期化を最初に実行
+import { startTracing } from './config/tracing.js';
 await startTracing();
-```
 
-```typescript
-// src/index.ts — 通常の static import のままでよい
 import { serve } from '@hono/node-server';
-import { Hono } from 'hono';
 import { httpInstrumentationMiddleware } from '@hono/otel';
+import { Hono } from 'hono';
 // ...
 ```
 
-```json
-// package.json
-"scripts": {
-  "dev": "tsx watch --import ./src/config/tracing-preload.ts src/index.ts",
-  "build": "tsc",
-  "start": "node --import ./dist/config/tracing-preload.js dist/index.js"
-}
-```
-
-```dockerfile
-# Dockerfile — npm start 経由だとシグナルが届かないため node を直接呼ぶ
-CMD ["node", "--import", "./dist/config/tracing-preload.js", "dist/index.js"]
-```
+ESM では static import はすべてホイストされるが、`await startTracing()` は `serve()` より確実に先に実行される。`HttpInstrumentation` の http モジュールへのパッチは `sdk.start()` のタイミングで適用されるため、サーバーが接続を受け付ける前に確実に完了する。
 
 **トークン自動更新**
 `OTLPTraceExporter` は初期化時にトークンを固定するため、1時間後に 401 エラーが発生する。
 `export()` 呼び出しのたびにトークンを再取得する `GoogleAuthOTLPExporter` クラスでラップすること。
+
+**デバッグログ**
+`export()` に以下のログを入れること。export の成功/失敗が Cloud Run ログで即座に確認できる。
+```
+[OTel:init] SDK started
+[OTel:export] exporting N span(s)
+[OTel:export] OK: N span(s) sent
+[OTel:export] FAILED: ...
+[OTel:export] ERROR (token/auth): ...
+```
 
 **エンドポイント**
 ```
@@ -87,29 +80,45 @@ textMapPropagator: new CompositePropagator({
 **環境変数**
 ```bash
 GOOGLE_CLOUD_PROJECT=your-project-id
-GOOGLE_CLOUD_QUOTA_PROJECT=your-project-id  # authorized_user の場合のみ
+GOOGLE_CLOUD_QUOTA_PROJECT=your-project-id  # authorized_user (ローカル開発) の場合のみ
 OTEL_RESOURCE_ATTRIBUTES="gcp.project_id=xxx,service.name=my-service,service.version=1.0.0"
 ```
 
 ## 2. Hono ミドルウェア設定 (index.ts)
 
+`HttpInstrumentation`（NodeSDK）と `httpInstrumentationMiddleware`（`@hono/otel`）の両方を使う。
+`HttpInstrumentation` が Node.js HTTP レベルでスパンを作成し、`httpInstrumentationMiddleware` が Hono のルートパターン（`GET /tools/qa/summary` など）をスパン名に反映する。
+
 ```typescript
+// src/index.ts
+import { httpInstrumentationMiddleware } from '@hono/otel';
+
 const otelMiddleware = httpInstrumentationMiddleware();
 app.use('*', (c, next) => {
-  // ヘルスチェックや静的エンドポイントをトレース除外
-  if (c.req.path === '/' || c.req.path === '/openapi.yaml') return next();
+  if (c.req.path === '/health') return next();  // ヘルスチェックはトレース除外
   return otelMiddleware(c, next);
 });
+
+app.get('/health', (c) => c.json({ status: 'ok' }));
 ```
 
-`HttpInstrumentation` 側の `ignoreIncomingRequestHook` も同じパスに合わせること。
+`HttpInstrumentation` 側でも同じパスを除外すること。
 
 ```typescript
 new HttpInstrumentation({
   ignoreIncomingRequestHook: (req) => {
-    return req.url === '/' || req.url === '/openapi.yaml';
+    return req.url === '/health';
   },
 }),
+```
+
+これにより Cloud Trace に表示される構造:
+
+```
+(Missing parent: HttpInstrumentation span)
+  └── GET /tools/qa/summary (httpInstrumentationMiddleware が作成)
+        ├── qa.generateSearchQuery
+        └── qa.summarize
 ```
 
 ## 3. 構造化ロギング (LoggingService)
@@ -130,13 +139,6 @@ new HttpInstrumentation({
 ```
 
 Cloud Logging は各ログエントリに `insertId` を自動付与するため、アプリ側で UUID を生成する必要はない。
-ログメソッドの戻り値は `void`。
-
-### traceId 優先順位
-
-1. `traceparent` ヘッダー (W3C Trace Context)
-2. `X-Cloud-Trace-Context` ヘッダー (Google Cloud 独自形式)
-3. アクティブな OTel span から取得
 
 ### Hono ルートでの使い方
 
@@ -158,12 +160,12 @@ app.post('/something', async (c) => {
 
 ## 4. 手動 Span パターン (ルートハンドラー)
 
-### 推奨: `startActiveSpan`
+### 推奨: `startSpan` + `context.with`
 
-`startActiveSpan` を使うこと。自動で現在の active context を親にし、コールバック内でスパンがアクティブになる。
+`tracer.startSpan()` でスパンを作成し、`context.with(trace.setSpan(context.active(), span), fn)` で明示的にコンテキストを伝播する。
 
 ```typescript
-import { SpanKind, SpanStatusCode, trace } from '@opentelemetry/api';
+import { context, SpanKind, SpanStatusCode, trace } from '@opentelemetry/api';
 
 const tracer = trace.getTracer('my-route', '1.0.0');
 
@@ -171,25 +173,25 @@ const tracer = trace.getTracer('my-route', '1.0.0');
 app.post('/something', async (c) => {
   let result;
   try {
-    result = await tracer.startActiveSpan(
-      'my-operation',
-      { kind: SpanKind.CLIENT, attributes: { 'db.system': 'bigquery' } },
-      async (span) => {
-        try {
-          const r = await externalCall();
-          span.setAttribute('result.count', r.length);
-          span.setStatus({ code: SpanStatusCode.OK });
-          return r;
-        } catch (err) {
-          const message = err instanceof Error ? err.message : String(err);
-          span.recordException(err instanceof Error ? err : new Error(message));
-          span.setStatus({ code: SpanStatusCode.ERROR, message });
-          throw err;  // re-throw して外側の catch でレスポンス返却
-        } finally {
-          span.end();  // finally で必ず 1 回だけ end する
-        }
-      },
-    );
+    const span = tracer.startSpan('my-operation', {
+      kind: SpanKind.CLIENT,
+      attributes: { 'db.system': 'bigquery' },
+    });
+    result = await context.with(trace.setSpan(context.active(), span), async () => {
+      try {
+        const r = await externalCall();
+        span.setAttribute('result.count', r.length);
+        span.setStatus({ code: SpanStatusCode.OK });
+        return r;
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        span.recordException(err instanceof Error ? err : new Error(message));
+        span.setStatus({ code: SpanStatusCode.ERROR, message });
+        throw err;
+      } finally {
+        span.end();
+      }
+    });
   } catch (err) {
     return c.json({ error: '...' }, 500);
   }
@@ -197,90 +199,72 @@ app.post('/something', async (c) => {
 });
 ```
 
-### ネスト構造 (親子 span) — Cloud Trace ウォーターフォール表示
+### 複数スパン（シーケンシャル）
 
-`startActiveSpan` はコールバック内でそのスパンをアクティブにするため、**コールバック内でさらに `startActiveSpan` を呼ぶだけで子スパンになる**。`context.with` による手動伝播は不要。
+`context.with()` の外側で `context.active()` を呼ぶと `httpInstrumentationMiddleware` のスパンが親になる。各スパンは HTTP スパンの直接の子（兄弟関係）になる。
 
 ```typescript
 // Cloud Trace に表示される構造:
-// HTTP span (POST /tools/qa/summary)
-//   └── qa.summary (parent, INTERNAL)
-//        ├── qa.generateQuery (child, INTERNAL)
-//        └── qa.search       (child, CLIENT)
+// GET /tools/qa/summary
+//   ├── qa.generateSearchQuery
+//   └── qa.summarize
 
-app.post('/summary', async (c) => {
+app.post('/summary', zValidator('json', schema), async (c) => {
+  const { question } = c.req.valid('json');
+  let query: string;
+
   try {
-    const response = await tracer.startActiveSpan(
-      'qa.summary',
-      { kind: SpanKind.INTERNAL, attributes: { 'llm.question': question } },
-      async (parentSpan) => {
-        try {
-          // 子スパン 1 — parentSpan がアクティブなので自動的に子になる
-          const query = await tracer.startActiveSpan(
-            'qa.generateQuery',
-            { kind: SpanKind.INTERNAL },
-            async (span) => {
-              try {
-                const q = await generateSearchQuery(question);
-                span.setAttribute('llm.generated_query', q);
-                span.setStatus({ code: SpanStatusCode.OK });
-                return q;
-              } catch (err) {
-                const message = err instanceof Error ? err.message : String(err);
-                span.recordException(err instanceof Error ? err : new Error(message));
-                span.setStatus({ code: SpanStatusCode.ERROR, message });
-                throw err;
-              } finally {
-                span.end();
-              }
-            },
-          );
-
-          // 子スパン 2 — parentSpan がアクティブなので自動的に子になる
-          const result = await tracer.startActiveSpan(
-            'qa.search',
-            { kind: SpanKind.CLIENT, attributes: { 'search.query': query } },
-            async (span) => {
-              try {
-                const r = await search(query);
-                span.setAttribute('search.result_count', r.length);
-                span.setStatus({ code: SpanStatusCode.OK });
-                return r;
-              } catch (err) {
-                const message = err instanceof Error ? err.message : String(err);
-                span.recordException(err instanceof Error ? err : new Error(message));
-                span.setStatus({ code: SpanStatusCode.ERROR, message });
-                throw err;
-              } finally {
-                span.end();
-              }
-            },
-          );
-
-          parentSpan.setAttribute('result.count', result.length);
-          parentSpan.setStatus({ code: SpanStatusCode.OK });
-          return c.json({ query, result });
-        } catch (err) {
-          const message = err instanceof Error ? err.message : String(err);
-          parentSpan.recordException(err instanceof Error ? err : new Error(message));
-          parentSpan.setStatus({ code: SpanStatusCode.ERROR, message });
-          throw err;
-        } finally {
-          parentSpan.end();
-        }
-      },
-    );
-    return response;
+    const span = tracer.startSpan('qa.generateSearchQuery', {
+      kind: SpanKind.INTERNAL,
+      attributes: { 'llm.question': question },
+    });
+    query = await context.with(trace.setSpan(context.active(), span), async () => {
+      try {
+        const q = await generateSearchQuery(question);
+        span.setAttribute('llm.generated_query', q);
+        span.setStatus({ code: SpanStatusCode.OK });
+        logger.logInfoWithContext(c, 'qa.generateSearchQuery: completed', { query: q });
+        return q;
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        span.recordException(err instanceof Error ? err : new Error(message));
+        span.setStatus({ code: SpanStatusCode.ERROR, message });
+        throw err;
+      } finally {
+        span.end();
+      }
+    });
   } catch (err) {
-    return c.json({ error: String(err) }, 500);
+    return c.json({ error: 'クエリ生成に失敗しました', detail: String(err) }, 500);
+  }
+
+  try {
+    const span = tracer.startSpan('qa.summarize', {
+      kind: SpanKind.CLIENT,
+      attributes: { 'search.query': query },
+    });
+    const result = await context.with(trace.setSpan(context.active(), span), async () => {
+      try {
+        const r = await summarize(query);
+        span.setAttribute('search.result_count', r.results.length);
+        span.setStatus({ code: SpanStatusCode.OK });
+        logger.logInfoWithContext(c, 'qa.summarize: completed', { resultCount: r.results.length });
+        return r;
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        span.recordException(err instanceof Error ? err : new Error(message));
+        span.setStatus({ code: SpanStatusCode.ERROR, message });
+        throw err;
+      } finally {
+        span.end();
+      }
+    });
+    return c.json({ query, result });
+  } catch (err) {
+    return c.json({ error: '検索に失敗しました', detail: String(err) }, 500);
   }
 });
 ```
-
-**ポイント:**
-- `startActiveSpan` のコールバック内では、そのスパンが自動的に active context になる
-- 入れ子で `startActiveSpan` を呼ぶだけで自動的に親子関係が形成される
-- `context.with(trace.setSpan(...))` による手動伝播は不要
 
 ### アンチパターン: `span.end()` の二重呼び出し（バグ）
 
@@ -300,33 +284,36 @@ try {
 }
 ```
 
-`startActiveSpan` + `throw err` パターンに統一することでこのバグを根本的に防げる。
-
-### withSpan ヘルパー (LoggingService) — エラー処理を自動化したい場合
-
-```typescript
-await logger.withSpan('my-operation', async (span) => {
-  span.setAttribute('key', 'value');
-  return await doSomething();
-  // エラー時は自動で span.recordException + setStatus(ERROR)
-});
-```
+`finally` のみで `span.end()` を呼び、エラーは `throw err` で再スローして外側の `catch` でレスポンスを返すパターンに統一すること。
 
 ## 5. SpanKind の選択基準
 
 | Kind | 使いどころ |
 |------|-----------|
-| `SERVER` | 受信 HTTP リクエスト（`@hono/otel` が自動設定） |
+| `SERVER` | 受信 HTTP リクエスト（`httpInstrumentationMiddleware` が自動設定） |
 | `CLIENT` | 外部 API・DB 呼び出し（BigQuery, Discovery Engine など） |
 | `INTERNAL` | LLM 推論・ビジネスロジックなど内部処理 |
 
-## 6. よくあるトラブル
+## 6. IAM 権限
+
+| ロール | 用途 |
+|--------|------|
+| `roles/cloudtrace.agent` | Cloud Trace へのスパン書き込み |
+| `roles/telemetry.tracesWriter` | Telemetry API (OTLP) へのスパン書き込み |
+| `roles/logging.logWriter` | Cloud Logging への書き込み |
+
+**注意**: `x-goog-user-project` ヘッダーを送る場合は追加で `roles/serviceusage.serviceUsageConsumer` が必要。
+ローカル開発（`UserRefreshClient`）では `GOOGLE_CLOUD_QUOTA_PROJECT` を設定するとこのヘッダーが自動付与される。
+Cloud Run のサービスアカウントには `GOOGLE_CLOUD_QUOTA_PROJECT` を設定しない、または `serviceusage.serviceUsageConsumer` ロールを付与する。
+
+## 7. よくあるトラブル
 
 | 症状 | 原因 | 対処 |
 |------|------|------|
-| カスタム span が HTTP trace と別々に表示される | `--import` プリロードなしで起動した / `HttpInstrumentation` が `http` にパッチ未適用 | `--import ./dist/config/tracing-preload.js` を起動コマンドに追加 |
+| カスタム span が HTTP trace と別々に表示される | `context.active()` に HTTP スパンが含まれていない | `context.with(trace.setSpan(context.active(), span), fn)` を使い明示的に伝播する |
 | 1時間後に 401 エラー | `OTLPTraceExporter` 直接使用 | `GoogleAuthOTLPExporter` でラップ |
+| Cloud Run で 403 Forbidden | `x-goog-user-project` ヘッダーが送られている / `telemetry.googleapis.com` が未有効化 | `GOOGLE_CLOUD_QUOTA_PROJECT` を service.yaml から削除するか `roles/serviceusage.serviceUsageConsumer` を付与。APIが未有効の場合は `gcloud services enable telemetry.googleapis.com` |
 | ログに trace 情報が付かない | `LoggingService` を使わず `console.log` を直接使用 | `logInfoWithContext` などを使う |
-| Cloud Trace にトレースが表示されない | `GOOGLE_CLOUD_PROJECT` 未設定 / IAM 権限不足 | `roles/cloudtrace.agent` を付与 |
-| tsx dev でエラー `Cannot find module 'watch'` | `--import` を `watch` サブコマンドより前に置いた | `tsx watch --import ./preload.ts src/index.ts` の順にする |
-| span データが壊れている / Cloud Trace で span の時刻が異常 | `catch` と `finally` の両方で `span.end()` を呼んでいる（二重呼び出し） | `startActiveSpan` + `throw err` パターンに統一し、`finally` のみで `span.end()` を呼ぶ |
+| Cloud Trace にトレースが表示されない | `GOOGLE_CLOUD_PROJECT` 未設定 / IAM 権限不足 | `roles/cloudtrace.agent` または `roles/telemetry.tracesWriter` を付与 |
+| span データが壊れている | `catch` と `finally` の両方で `span.end()` を呼んでいる | `finally` のみで `span.end()` を呼ぶ |
+| `[OTel:export] exporting` ログが出ない | SDK が初期化されていない（`startTracing()` 未呼び出し） | `index.ts` 先頭の `await startTracing()` を確認する |

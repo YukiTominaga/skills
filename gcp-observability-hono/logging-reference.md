@@ -18,7 +18,7 @@ export interface LogEntry {
 ## src/services/logging.service.ts
 
 ```typescript
-import { type Span, SpanStatusCode, trace } from '@opentelemetry/api';
+import { context, type Span, SpanStatusCode, trace } from '@opentelemetry/api';
 import { randomUUID } from 'crypto';
 import { config } from '../config/config.js';
 import type { LogStructureRequest } from '../types/logging.js';
@@ -160,7 +160,8 @@ export class LoggingService {
 
   /** カスタム span でラップ。エラー時に自動で recordException + setStatus(ERROR) */
   async withSpan<T>(spanName: string, fn: (span: Span) => Promise<T>): Promise<T> {
-    return await this.tracer.startActiveSpan(spanName, async (span) => {
+    const span = this.tracer.startSpan(spanName);
+    return await context.with(trace.setSpan(context.active(), span), async () => {
       try {
         const result = await fn(span);
         span.setStatus({ code: SpanStatusCode.OK });
