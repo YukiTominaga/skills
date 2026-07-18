@@ -63,22 +63,26 @@ package-lock.json
 
 ## Step 2: shadcn の初期化
 
-以下のコマンドを実行し、対話的に設定を進める:
+推奨は非対話（`-d`）実行。現行の shadcn（4.x）は Tailwind v4 / Next.js を自動検出し、
+`components.json`・`lib/utils.ts`・`components/ui/button.tsx` の生成と `app/globals.css` の
+更新までを一括で行う:
+
+```bash
+npx shadcn@latest init -d
+```
+
+> `-d` は base color = **Neutral**、CSS variables 有効のデフォルト構成で初期化する。
+> 実行後 `package.json` には `shadcn` 本体に加えて `class-variance-authority` /
+> `clsx` / `tailwind-merge` / `lucide-react` / `tw-animate-css` などが追加される。
+
+ベースカラーやスタイルを対話的に選びたい場合は `-d` を外して実行する:
 
 ```bash
 npx shadcn@latest init
 ```
 
-> 対話プロンプトで以下を選択するよう案内する:
-> - Which style would you like to use? → **Default**（または好みで）
-> - Which color would you like to use as base color? → **Slate**（または好みで）
-> - Would you like to use CSS variables for colors? → **Yes**
-
-ユーザーが「デフォルトで非対話的に実行したい」と言ったときは以下を使う:
-
-```bash
-npx shadcn@latest init -d
-```
+> 対話項目・選択肢は shadcn のバージョンで変わる。表示されたプロンプトに従って選択する
+> （base color の選択が中心）。特にこだわりがなければ上記の `-d` で十分。
 
 ---
 
@@ -160,7 +164,12 @@ node_modules
 
 ## Step 5: AGENTS.md の作成
 
-プロジェクトルートに `AGENTS.md` を作成する:
+プロジェクトルートに `AGENTS.md` を作成する。
+
+**まず既存内容を確認すること。** create-next-app のテンプレートや既存リポジトリには、
+すでに `<!-- BEGIN:nextjs-agent-rules -->` 〜 `<!-- END:nextjs-agent-rules -->` の
+ブロックが含まれている場合がある。その場合は**上書きせずスキップ**する（既存の注意書きを
+壊さない）。ブロックが無ければ以下を作成、`AGENTS.md` 自体が無ければ新規作成する:
 
 ```markdown
 <!-- BEGIN:nextjs-agent-rules -->
